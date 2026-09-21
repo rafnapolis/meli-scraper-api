@@ -1,83 +1,109 @@
-import httpx
 import random
-from bs4 import BeautifulSoup
+from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
-from typing import Dict, Any
+import httpx
+from selectolax.parser import HTMLParser
 
 app = FastAPI(
-    title="MELI Scraper API",
-    description="API profesional para extracción de datos de Mercado Libre (MX/BR)",
-    version="1.0.0"
+    title="Mercado Libre LATAM Scraper API",
+    description="API de web scraping en tiempo real para Mercado Libre en Latinoamérica.",
+    version="2.1.0",
 )
 
-# Lista de User-Agents reales para rotación
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1"
+ALLOWED_DOMAINS = [
+    "mercadolibre.com.mx", "mercadolivre.com.br", "mercadolibre.com.ar",
+    "mercadolibre.cl", "mercadolibre.com.co", "mercadolibre.com.pe", "mercadolibre.com.uy"
 ]
 
-def get_headers() -> Dict[str, str]:
-    """Genera headers aleatorios para emular un navegador real."""
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.40 Mobile Safari/537.36"
+]
+
+def get_random_headers() -> dict:
     return {
         "User-Agent": random.choice(USER_AGENTS),
-        "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,/ ;q=0.8",
-        "Referer": "https://www.google.com/"
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9,pt-BR;q=0.8",
     }
 
-async def scrape_meli_product(url: str) -> Dict[str, Any]:
-    """Lógica central de extracción asíncrona."""
-    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+async def parse_pdp_full(url: str) -> dict:
+    if not any(domain in url.lower() for domain in ALLOWED_DOMAINS):
+        raise HTTPException(status_code=400, detail="URL no soportada.")
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
         try:
-            response = await client.get(url, headers=get_headers())
-            
-            if response.status_code == 404:
-                raise HTTPException(status_code=404, detail="Producto no encontrado")
-            if response.status_code != 200:
-                raise HTTPException(status_code=400, detail=f"Error de conexión con Mercado Libre: {response.status_code}")
+            response = await client.get(url, headers=get_random_headers())
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Error de conexión: {str(exc)}")
 
-            soup = BeautifulSoup(response.text, "html.parser")
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail="Error al acceder a Mercado Libre.")
 
-            # Extracción con selectores robustos (clases comunes de MELI)
-            title_element = soup.find("h1", class_="ui-pdp-title")
-            price_fraction = soup.find("span", class_="andes-money-amount__fraction")
-            price_cents = soup.find("span", class_="andes-money-amount__cents")
-            currency = soup.find("span", class_="andes-money-amount__currency-symbol")
-            condition = soup.find("span", class_="ui-pdp-subtitle")
+    tree = HTMLParser(response.text)
 
-            if not title_element:
-                raise ValueError("No se pudo parsear la estructura del producto")
+    # 1. Product Name
+    title_node = tree.css_first("h1.ui-pdp-title")
+    title = title_node.text(strip=True) if title_node else None
 
-            return {
-                "title": title_element.get_text().strip(),
-                "price": {
-                    "currency": currency.get_text().strip() if currency else None,
-                    "integer": price_fraction.get_text().replace(".", "").strip() if price_fraction else "0",
-                    "decimals": price_cents.get_text().strip() if price_cents else "00"
-                },
-                "condition": condition.get_text().split("|")[0].strip() if condition else "No especificado",
-                "url": url
-            }
+    # 2. Selling Price & Currency
+    currency_node = tree.css_first(".andes-money-amount__currency-symbol")
+    integer_node = tree.css_first(".andes-money-amount__fraction")
+    decimal_node = tree.css_first(".andes-money-amount__cents")
+    
+    currency = currency_node.text(strip=True) if currency_node else "$"
+    integer_price = integer_node.text(strip=True) if integer_node else "0"
+    decimals = decimal_node.text(strip=True) if decimal_node else "00"
+    selling_price = f"{currency} {integer_price}.{decimals}"
 
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=400, detail=f"Error de red: {exc}")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Error procesando la URL: {str(e)}")
+    # 3. List Price (Precio original antes de descuento)
+    original_price_node = tree.css_first("s.andes-money-amount .andes-money-amount__fraction")
+    list_price = f"{currency} {original_price_node.text(strip=True)}" if original_price_node else selling_price
 
-@app.get("/v1/mx/scrape")
-async def scrape_mexico(url: str = Query(..., description="URL de Mercado Libre México")):
-    if "mercadolibre.com.mx" not in url:
-        raise HTTPException(status_code=400, detail="La URL debe pertenecer a mercadolibre.com.mx")
-    return await scrape_meli_product(url)
+    # 4. Discount Percentage
+    discount_node = tree.css_first("span.ui-pdp-price__second-line__discount")
+    discount = discount_node.text(strip=True) if discount_node else "0%"
 
-@app.get("/v1/br/scrape")
-async def scrape_brasil(url: str = Query(..., description="URL de Mercado Libre Brasil")):
-    if "mercadolivre.com.br" not in url:
-        raise HTTPException(status_code=400, detail="La URL debe pertenecer a mercadolivre.com.br")
-    return await scrape_meli_product(url)
+    # 5. Installments / EMI
+    installments_node = tree.css_first("p.ui-pdp-color--GREEN") or tree.css_first(".ui-pdp-media__title")
+    installments = installments_node.text(strip=True) if installments_node else None
 
-@app.get("/")
-def health_check():
-    return {"status": "online", "message": "MELI Scraper API is running"}
+    # 6. Rating & Reviews Count
+    rating_node = tree.css_first("span.ui-pdp-review__rating")
+    reviews_count_node = tree.css_first("span.ui-pdp-review__amount")
+    rating = rating_node.text(strip=True) if rating_node else None
+    review_count = reviews_count_node.text(strip=True) if reviews_count_node else "0"
+
+    # 7. Seller Name
+    seller_node = tree.css_first(".ui-pdp-seller__link-trigger") or tree.css_first("button.ui-pdp-seller__link-trigger")
+    seller_name = seller_node.text(strip=True) if seller_node else None
+
+    # 8. Category & Brand
+    brand_node = tree.css_first("tr.andes-table__row th.andes-table__header")
+    brand = brand_node.text(strip=True) if brand_node else None
+    
+    categories = [node.text(strip=True) for node in tree.css("a.andes-breadcrumb__link")]
+
+    # 9. Description
+    desc_node = tree.css_first("p.ui-pdp-description__content")
+    description = desc_node.text(strip=True) if desc_node else None
+
+    return {
+        "product_name": title,
+        "brand": brand,
+        "category": categories,
+        "list_price": list_price,
+        "selling_price": selling_price,
+        "discount": discount,
+        "installments": installments,
+        "product_rating": rating,
+        "review_count": review_count,
+        "seller_name": seller_name,
+        "description": description,
+        "url": url
+    }
+
+@app.get("/v1/latam/scrape", summary="PDP Full Scraper")
+async def scrape_pdp(url: str = Query(...)):
+    return await parse_pdp_full(url)
