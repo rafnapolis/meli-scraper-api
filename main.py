@@ -1,14 +1,14 @@
 import random
+import re
 from fastapi import FastAPI, HTTPException, Query
 import httpx
 
 app = FastAPI(
     title="Mercado Libre LATAM Scraper API",
     description="API de web scraping en tiempo real para Mercado Libre en Latinoamérica.",
-    version="2.2.0"
+    version="2.3.0"
 )
 
-# Intentar cargar selectolax, o usar BeautifulSoup como respaldo seguro
 try:
     from selectolax.parser import HTMLParser
     USE_SELECTOLAX = True
@@ -34,15 +34,22 @@ def get_headers() -> dict:
     return {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "es-ES,es;q=0.9,pt-BR;q=0.8,pt;q=0.7,en;q=0.6",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
+        "Accept-Language": "pt-BR,pt;q=0.9,es-ES,es;q=0.8,en;q=0.7",
+        "Cache-Control": "max-age=0",
+        "Sec-Ch-Ua": '"Google Chrome";v="123", "Not:A-Brand";v="8"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
         "Upgrade-Insecure-Requests": "1"
     }
 
 async def fetch_pdp(url: str) -> dict:
-    # Validar que sea un dominio oficial de Mercado Libre
-    if not any(domain in url.lower() for domain in ALLOWED_DOMAINS):
+    clean_url = url.split("?")[0] if "?" in url else url
+    
+    if not any(domain in clean_url.lower() for domain in ALLOWED_DOMAINS):
         raise HTTPException(status_code=400, detail="URL no soportada. Ingrese una URL valida de Mercado Libre LATAM.")
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
@@ -55,51 +62,64 @@ async def fetch_pdp(url: str) -> dict:
         raise HTTPException(status_code=res.status_code, detail=f"No se pudo acceder a la pagina. Codigo HTTP: {res.status_code}")
 
     html = res.text
-    
+    title = None
+    currency = "R$" if "mercadolivre.com.br" in clean_url else "$"
+    integer = "0"
+    decimals = "00"
+    seller = "Mercado Livre / Vendedor Oficial" if "mercadolivre.com.br" in clean_url else "Mercado Libre / Vendedor Oficial"
+
     if USE_SELECTOLAX:
         tree = HTMLParser(html)
         
-        # Selectores Múltiples para Título (Soporta publicaciones estándar y páginas /p/ de catálogo)
+        # 1. Extracción de Título (Prioridad: h1 -> meta title -> title tag)
         t_node = (
             tree.css_first("h1.ui-pdp-title") or 
             tree.css_first("h1.poly-component__title") or 
-            tree.css_first(".ui-pdp-container__row--header h1") or
+            tree.css_first("h1.ui-search-item__title") or
             tree.css_first("h1")
         )
-        title = t_node.text(strip=True) if t_node else "Sin titulo disponible"
-        
-        # Selectores Múltiples para Precio y Moneda
+        if t_node and t_node.text(strip=True):
+            title = t_node.text(strip=True)
+        else:
+            meta_t = tree.css_first("meta[name='title']") or tree.css_first("meta[property='og:title']")
+            if meta_t and meta_t.attributes.get("content"):
+                title = meta_t.attributes.get("content").split("|")[0].strip()
+            else:
+                head_t = tree.css_first("title")
+                if head_t:
+                    title = head_t.text(strip=True).split("|")[0].strip()
+
+        # 2. Extracción de Moneda y Precio
         c_node = tree.css_first(".andes-money-amount__currency-symbol")
+        if c_node and c_node.text(strip=True):
+            currency = c_node.text(strip=True)
+            
         i_node = (
-            tree.css_first("span.ui-pdp-price__second-line .andes-money-amount__fraction") or 
             tree.css_first("span.andes-money-amount__fraction") or 
-            tree.css_first(".andes-money-amount__fraction")
+            tree.css_first(".andes-money-amount__fraction") or
+            tree.css_first("meta[itemprop='price']")
         )
+        if i_node:
+            if i_node.tag == "meta":
+                integer = i_node.attributes.get("content", "0").split(".")[0]
+            else:
+                integer = i_node.text(strip=True)
+
         d_node = (
-            tree.css_first("span.ui-pdp-price__second-line .andes-money-amount__cents") or 
             tree.css_first("span.andes-money-amount__cents") or 
             tree.css_first(".andes-money-amount__cents")
         )
-        
-        currency = c_node.text(strip=True) if c_node else "$"
-        integer = i_node.text(strip=True) if i_node else "0"
-        decimals = d_node.text(strip=True) if d_node else "00"
-        
-        # Selectores Múltiples para Vendedor
+        if d_node:
+            decimals = d_node.text(strip=True)
+
+        # 3. Vendedor
         s_node = (
             tree.css_first(".ui-pdp-seller__link-trigger") or 
             tree.css_first("button.ui-pdp-seller__link-trigger") or 
-            tree.css_first(".ui-seller-info__title") or 
-            tree.css_first(".ui-pdp-seller__header__title")
+            tree.css_first(".ui-seller-info__title")
         )
-        seller = s_node.text(strip=True) if s_node else "Mercado Libre / Vendedor No Especificado"
-        
-        # Extracción de Condición y Rating
-        cond_node = tree.css_first("span.ui-pdp-subtitle")
-        condition = cond_node.text(strip=True) if cond_node else "Nuevo"
-        
-        rate_node = tree.css_first("span.ui-pdp-review__rating")
-        rating = rate_node.text(strip=True) if rate_node else "N/D"
+        if s_node and s_node.text(strip=True):
+            seller = s_node.text(strip=True)
 
     else:
         soup = BeautifulSoup(html, "html.parser")
@@ -109,36 +129,38 @@ async def fetch_pdp(url: str) -> dict:
             soup.select_one("h1.poly-component__title") or 
             soup.select_one("h1")
         )
-        title = t_node.get_text(strip=True) if t_node else "Sin titulo disponible"
-        
+        if t_node and t_node.get_text(strip=True):
+            title = t_node.get_text(strip=True)
+        else:
+            meta_t = soup.select_one("meta[name='title']") or soup.select_one("meta[property='og:title']")
+            if meta_t and meta_t.get("content"):
+                title = meta_t.get("content").split("|")[0].strip()
+            else:
+                head_t = soup.select_one("title")
+                if head_t:
+                    title = head_t.get_text(strip=True).split("|")[0].strip()
+
         c_node = soup.select_one(".andes-money-amount__currency-symbol")
+        if c_node:
+            currency = c_node.get_text(strip=True)
+
         i_node = (
-            soup.select_one("span.ui-pdp-price__second-line .andes-money-amount__fraction") or 
             soup.select_one("span.andes-money-amount__fraction") or 
             soup.select_one(".andes-money-amount__fraction")
         )
-        d_node = (
-            soup.select_one("span.ui-pdp-price__second-line .andes-money-amount__cents") or 
-            soup.select_one("span.andes-money-amount__cents") or 
-            soup.select_one(".andes-money-amount__cents")
-        )
-        
-        currency = c_node.get_text(strip=True) if c_node else "$"
-        integer = i_node.get_text(strip=True) if i_node else "0"
-        decimals = d_node.get_text(strip=True) if d_node else "00"
-        
-        s_node = (
-            soup.select_one(".ui-pdp-seller__link-trigger") or 
-            soup.select_one("button.ui-pdp-seller__link-trigger") or 
-            soup.select_one(".ui-seller-info__title")
-        )
-        seller = s_node.get_text(strip=True) if s_node else "Mercado Libre / Vendedor No Especificado"
-        
-        cond_node = soup.select_one("span.ui-pdp-subtitle")
-        condition = cond_node.get_text(strip=True) if cond_node else "Nuevo"
-        
-        rate_node = soup.select_one("span.ui-pdp-review__rating")
-        rating = rate_node.get_text(strip=True) if rate_node else "N/D"
+        if i_node:
+            integer = i_node.get_text(strip=True)
+
+        d_node = soup.select_one("span.andes-money-amount__cents")
+        if d_node:
+            decimals = d_node.get_text(strip=True)
+
+        s_node = soup.select_one(".ui-pdp-seller__link-trigger")
+        if s_node:
+            seller = s_node.get_text(strip=True)
+
+    if not title:
+        title = "Produto Mercado Livre" if "mercadolivre.com.br" in clean_url else "Producto Mercado Libre"
 
     return {
         "product_name": title,
@@ -148,15 +170,10 @@ async def fetch_pdp(url: str) -> dict:
             "integer": integer,
             "decimals": decimals
         },
-        "condition": condition,
-        "rating": rating,
+        "condition": "Nuevo",
         "seller_name": seller,
         "url": url
     }
-
-# ------------------------------------------------------------------
-# RUTAS DE LA API
-# ------------------------------------------------------------------
 
 @app.get("/")
 async def root():
