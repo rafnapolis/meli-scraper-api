@@ -7,7 +7,6 @@ app = FastAPI(
     version="2.1.0"
 )
 
-# Intentar usar selectolax, si no está instalado usa BeautifulSoup/fallback
 try:
     from selectolax.parser import HTMLParser
     USE_SELECTOLAX = True
@@ -91,17 +90,14 @@ async def fetch_pdp(url: str) -> dict:
         "url": url
     }
 
-# Endpoint Raiz para que no de 404 al abrir el dominio directamente
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "Mercado Libre Scraper API esta activa."}
 
-# Endpoint Universal LATAM
 @app.get("/v1/latam/scrape")
 async def scrape_latam(url: str = Query(...)):
     return await fetch_pdp(url)
 
-# Endpoints por Pais
 @app.get("/v1/mx/scrape")
 async def scrape_mx(url: str = Query(...)):
     return await fetch_pdp(url)
