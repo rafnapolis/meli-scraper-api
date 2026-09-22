@@ -5,7 +5,7 @@ import httpx
 
 app = FastAPI(
     title="Mercado Libre LATAM Scraper API",
-    version="2.4.0"
+    version="2.5.0"
 )
 
 try:
@@ -28,7 +28,7 @@ USER_AGENTS = [
 ]
 
 def clean_title_from_url(url: str) -> str:
-    """Extrae el nombre limpio del producto directamente desde la URL si hay bloqueo."""
+    """Extrae el título formateado directamente desde el enlace si el HTML viene bloqueado."""
     try:
         path = url.split("mercadolivre.com.br/")[-1].split("mercadolibre.com.ar/")[-1].split("mercadolibre.com.mx/")[-1]
         raw_slug = path.split("/p/")[0].split("/MLA")[0].split("/MLB")[0]
@@ -36,6 +36,16 @@ def clean_title_from_url(url: str) -> str:
         return " ".join(word.capitalize() for word in words)
     except Exception:
         return "Producto Mercado Libre"
+
+def extract_item_id(url: str) -> str | None:
+    """Extrae el ID del producto (ej: MLB58353028 o MLA26219803) para consultar la API directa."""
+    match = re.search(r'/(ML[A-Z]\d+)', url)
+    if match:
+        return match.group(1)
+    match_p = re.search(r'/p/(ML[A-Z]\d+)', url)
+    if match_p:
+        return match_p.group(1)
+    return None
 
 def get_headers() -> dict:
     return {
@@ -71,7 +81,7 @@ async def fetch_pdp(url: str) -> dict:
     if USE_SELECTOLAX:
         tree = HTMLParser(html)
         
-        # 1. Extracción de Título
+        # 1. Título
         t_node = tree.css_first("h1.ui-pdp-title") or tree.css_first("h1.poly-component__title") or tree.css_first("h1")
         if t_node and t_node.text(strip=True) and "Por segurança" not in t_node.text(strip=True):
             title = t_node.text(strip=True)
@@ -80,7 +90,7 @@ async def fetch_pdp(url: str) -> dict:
             if meta_t and meta_t.attributes.get("content") and "Por segurança" not in meta_t.attributes.get("content"):
                 title = meta_t.attributes.get("content").split("|")[0].strip()
 
-        # 2. Extracción de Precio
+        # 2. Precio desde HTML
         i_node = tree.css_first("span.andes-money-amount__fraction") or tree.css_first(".andes-money-amount__fraction")
         if i_node:
             integer = i_node.text(strip=True)
@@ -93,9 +103,38 @@ async def fetch_pdp(url: str) -> dict:
         if s_node and s_node.text(strip=True):
             seller = s_node.text(strip=True)
 
-    # Fallback si saltó el CAPTCHA / Pantalla de Seguridad
+    # Fallback si el título viene vació o bloqueado
     if not title or "Por segurança" in title or "Seguridad" in title:
         title = clean_title_from_url(url)
+
+    # Fallback de Precio mediante API Pública si el HTML devolvió 0 por bloqueo anti-bot
+    if integer == "0" or integer == "":
+        item_id = extract_item_id(url)
+        if item_id:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                try:
+                    # Intento consulta a API directa de productos o catálogo
+                    api_res = await client.get(f"https://api.mercadolibre.com/products/{item_id}")
+                    if api_res.status_code == 200:
+                        data = api_res.json()
+                        if "name" in data and data["name"]:
+                            title = data["name"]
+                        if "buy_box_winner" in data and data["buy_box_winner"]:
+                            price_val = str(data["buy_box_winner"].get("price", "0"))
+                            parts = price_val.split(".")
+                            integer = parts[0]
+                            decimals = parts[1] if len(parts) > 1 else "00"
+                    else:
+                        # Intento con endpoint alternativo de publicaciones
+                        item_res = await client.get(f"https://api.mercadolibre.com/items/{item_id}")
+                        if item_res.status_code == 200:
+                            data = item_res.json()
+                            price_val = str(data.get("price", "0"))
+                            parts = price_val.split(".")
+                            integer = parts[0]
+                            decimals = parts[1] if len(parts) > 1 else "00"
+                except Exception:
+                    pass
 
     return {
         "product_name": title,
