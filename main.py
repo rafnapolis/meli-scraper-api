@@ -6,7 +6,7 @@ import httpx
 
 app = FastAPI(
     title="Mercado Libre LATAM Scraper API",
-    version="2.7.0"
+    version="2.8.0"
 )
 
 try:
@@ -37,23 +37,22 @@ def clean_title_from_url(url: str) -> str:
     except Exception:
         return "Producto Mercado Libre"
 
-def extract_item_id(url: str) -> tuple[str | None, bool]:
-    p_match = re.search(r'/p/(ML[A-Z]\d+)', url)
+def extract_item_id(url: str) -> tuple[str | None, str]:
+    """
+    Retorna (id, site_id) ej: ('MLA53301314', 'MLA')
+    """
+    p_match = re.search(r'/(p/)?(ML[A-Z])[-_]?(\d+)', url)
     if p_match:
-        return p_match.group(1), True
-    
-    item_match = re.search(r'/(ML[A-Z]-?\d+)', url)
-    if item_match:
-        raw_id = item_match.group(1).replace("-", "")
-        return raw_id, False
-        
-    return None, False
+        site_prefix = p_match.group(2)
+        number_id = p_match.group(3)
+        return f"{site_prefix}{number_id}", site_prefix
+    return None, "MLA"
 
 def get_headers() -> dict:
     return {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "pt-BR,pt;q=0.9,es-ES,es;q=0.8,en;q=0.7",
+        "Accept-Language": "es-AR,es-ES,es;q=0.9,pt-BR;q=0.8,en;q=0.7",
         "Cache-Control": "no-cache",
         "Upgrade-Insecure-Requests": "1"
     }
@@ -67,7 +66,7 @@ async def fetch_pdp(url: str) -> dict:
     html = ""
     res_status = 200
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
         try:
             res = await client.get(url, headers=get_headers())
             res_status = res.status_code
@@ -82,8 +81,8 @@ async def fetch_pdp(url: str) -> dict:
     decimals = "00"
     seller = "Mercado Livre / Vendedor Oficial" if "mercadolivre.com.br" in clean_url else "Mercado Libre / Vendedor Oficial"
 
-    # SI EL HTML RESPONDIÓ BIEN (200), EXTRAEMOS DATOS VÍA SCRAPING Y JSON-LD
-    if res_status == 200 and html:
+    # 1. SCRAPING DIRECTO SI LA PÁGINA RESPONDIÓ SIN CAPTCHA
+    if res_status == 200 and html and "completá este paso" not in html and "Por segurança" not in html:
         try:
             json_ld_matches = re.findall(r'<script type="application/ld\+json">(.*?)</script>', html, re.DOTALL)
             for json_str in json_ld_matches:
@@ -114,106 +113,83 @@ async def fetch_pdp(url: str) -> dict:
         except Exception:
             pass
 
-        if integer == "0" or not title or "Por segurança" in str(title):
+        if integer == "0" or not title:
             if USE_SELECTOLAX:
                 tree = HTMLParser(html)
-                if not title or "Por segurança" in str(title):
-                    t_node = tree.css_first("h1.ui-pdp-title") or tree.css_first("h1.poly-component__title") or tree.css_first("h1")
-                    if t_node and t_node.text(strip=True) and "Por segurança" not in t_node.text(strip=True):
-                        title = t_node.text(strip=True)
+                t_node = tree.css_first("h1.ui-pdp-title") or tree.css_first("h1.poly-component__title") or tree.css_first("h1")
+                if t_node and t_node.text(strip=True):
+                    title = t_node.text(strip=True)
 
-                if integer == "0":
-                    i_node = (
-                        tree.css_first(".ui-pdp-price__second-line span.andes-money-amount__fraction") or
-                        tree.css_first("span.andes-money-amount__fraction") or 
-                        tree.css_first(".andes-money-amount__fraction")
-                    )
-                    if i_node:
-                        integer = i_node.text(strip=True)
+                i_node = tree.css_first("span.andes-money-amount__fraction") or tree.css_first(".andes-money-amount__fraction")
+                if i_node:
+                    integer = i_node.text(strip=True)
 
-                    d_node = (
-                        tree.css_first(".ui-pdp-price__second-line span.andes-money-amount__cents") or
-                        tree.css_first("span.andes-money-amount__cents") or 
-                        tree.css_first(".andes-money-amount__cents")
-                    )
-                    if d_node:
-                        decimals = d_node.text(strip=True)
+                d_node = tree.css_first("span.andes-money-amount__cents") or tree.css_first(".andes-money-amount__cents")
+                if d_node:
+                    decimals = d_node.text(strip=True)
 
                 s_node = tree.css_first(".ui-pdp-seller__link-trigger") or tree.css_first(".ui-seller-info__title")
                 if s_node and s_node.text(strip=True):
                     seller = s_node.text(strip=True)
 
-            else:
-                soup = BeautifulSoup(html, "html.parser")
-                if not title or "Por segurança" in str(title):
-                    t_node = soup.select_one("h1.ui-pdp-title") or soup.select_one("h1.poly-component__title") or soup.select_one("h1")
-                    if t_node and t_node.get_text(strip=True) and "Por segurança" not in t_node.get_text(strip=True):
-                        title = t_node.get_text(strip=True)
+    # 2. RESPALDO ANTI-BLOQUEO: CONSULTA A LA API OFICIAL DE MERCADO LIBRE
+    if integer == "0" or integer == "" or not title or "completá este paso" in str(title) or "Por segurança" in str(title):
+        item_id, site_id = extract_item_id(url)
+        clean_title = clean_title_from_url(url)
+        if not title or "completá este paso" in str(title) or "Por segurança" in str(title):
+            title = clean_title
 
-                if integer == "0":
-                    i_node = soup.select_one("span.andes-money-amount__fraction") or soup.select_one(".andes-money-amount__fraction")
-                    if i_node:
-                        integer = i_node.get_text(strip=True)
-
-                    d_node = soup.select_one("span.andes-money-amount__cents") or soup.select_one(".andes-money-amount__cents")
-                    if d_node:
-                        decimals = d_node.get_text(strip=True)
-
-                s_node = soup.select_one(".ui-pdp-seller__link-trigger") or soup.select_one(".ui-seller-info__title")
-                if s_node and s_node.get_text(strip=True):
-                    seller = s_node.get_text(strip=True)
-
-    # RESPALDO MEDIANTE API OFICIAL DE MERCADO LIBRE SI DIO 404 O SI EL PRECIO SIGUE EN 0
-    if integer == "0" or integer == "" or res_status != 200:
-        item_id, is_catalog = extract_item_id(url)
         if item_id:
             async with httpx.AsyncClient(timeout=8.0) as client:
                 try:
-                    if is_catalog:
-                        api_res = await client.get(f"https://api.mercadolibre.com/products/{item_id}")
-                        if api_res.status_code == 200:
-                            data = api_res.json()
-                            if "name" in data and data["name"]:
-                                title = data["name"]
-                            
-                            buy_box = data.get("buy_box_winner")
-                            if buy_box and "price" in buy_box:
-                                price_val = str(buy_box["price"])
-                                parts = price_val.split(".")
-                                integer = parts[0]
-                                decimals = parts[1] if len(parts) > 1 else "00"
-                                if len(decimals) == 1:
-                                    decimals += "0"
-                            elif "price" in data:
-                                price_val = str(data["price"])
-                                parts = price_val.split(".")
-                                integer = parts[0]
-                                decimals = parts[1] if len(parts) > 1 else "00"
-                                if len(decimals) == 1:
-                                    decimals += "0"
-                    else:
-                        item_res = await client.get(f"https://api.mercadolibre.com/items/{item_id}")
-                        if item_res.status_code == 200:
-                            data = item_res.json()
-                            if "title" in data and data["title"]:
-                                title = data["title"]
-                            price_val = str(data.get("price", "0"))
+                    # A. Probar con API de productos de catálogo (/products/...)
+                    prod_res = await client.get(f"https://api.mercadolibre.com/products/{item_id}")
+                    if prod_res.status_code == 200:
+                        p_data = prod_res.json()
+                        if "name" in p_data and p_data["name"]:
+                            title = p_data["name"]
+                        buy_box = p_data.get("buy_box_winner")
+                        if buy_box and "price" in buy_box:
+                            price_val = str(buy_box["price"])
                             parts = price_val.split(".")
                             integer = parts[0]
                             decimals = parts[1] if len(parts) > 1 else "00"
                             if len(decimals) == 1:
                                 decimals += "0"
+                    else:
+                        # B. Probar con API de ítems (/items/...)
+                        item_res = await client.get(f"https://api.mercadolibre.com/items/{item_id}")
+                        if item_res.status_code == 200:
+                            i_data = item_res.json()
+                            if "title" in i_data and i_data["title"]:
+                                title = i_data["title"]
+                            price_val = str(i_data.get("price", "0"))
+                            parts = price_val.split(".")
+                            integer = parts[0]
+                            decimals = parts[1] if len(parts) > 1 else "00"
+                            if len(decimals) == 1:
+                                decimals += "0"
+                        else:
+                            # C. Búsqueda por palabras clave del título en la API del sitio correspondiente
+                            search_q = clean_title.replace(" ", "%20")
+                            search_res = await client.get(f"https://api.mercadolibre.com/sites/{site_id}/search?q={search_q}&limit=1")
+                            if search_res.status_code == 200:
+                                s_data = search_res.json()
+                                results = s_data.get("results", [])
+                                if results:
+                                    first_item = results[0]
+                                    if not title or title == "Producto Mercado Libre":
+                                        title = first_item.get("title", title)
+                                    price_val = str(first_item.get("price", "0"))
+                                    parts = price_val.split(".")
+                                    integer = parts[0]
+                                    decimals = parts[1] if len(parts) > 1 else "00"
+                                    if len(decimals) == 1:
+                                        decimals += "0"
                 except Exception:
                     pass
 
-    if not title or "Por segurança" in title or "Seguridad" in title:
-        title = clean_title_from_url(url)
-
     integer = integer.replace(".", "").replace(",", "")
-
-    # Si tras intentar por scraping y por API el producto no existe en absoluto en Mercado Libre
-    if integer == "0" and res_status == 404:
-        raise HTTPException(status_code=404, detail="El producto indicado no existe o fue eliminado de Mercado Libre.")
 
     return {
         "product_name": title,
