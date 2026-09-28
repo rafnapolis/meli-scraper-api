@@ -1,13 +1,61 @@
+import os
+import time
 import random
 import re
 import json
+import base64
+import urllib.parse
 from fastapi import FastAPI, HTTPException, Query
 import httpx
 
 app = FastAPI(
     title="Mercado Libre LATAM Scraper API",
-    version="2.8.0"
+    version="2.10.0"
 )
+
+# --- Credenciales de la API oficial (configurar como Secret Env Vars en Render) ---
+ML_CLIENT_ID = os.getenv("ML_CLIENT_ID", "")
+ML_CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET", "")
+ML_REDIRECT_URI = os.getenv("ML_REDIRECT_URI", "")  # opcional, solo para flujo user
+
+# Token de aplicacion (client_credentials) con refresh automatico
+_ml_app_token: dict = {"token": None, "expires_at": 0.0}
+
+
+def ml_headers() -> dict:
+    """Headers para api.mercadolibre.com; usa Bearer token si hay credenciales."""
+    h = {"Accept": "application/json"}
+    tok = _ml_app_token["token"]
+    if tok and _ml_app_token["expires_at"] > time.time():
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+
+async def get_ml_app_token(force: bool = False) -> str | None:
+    """Obtiene access_token de app publica via client_credentials (gratis, sin login usuario).
+    Se renueva automaticamente antes de expirar (~6 horas)."""
+    if not ML_CLIENT_ID or not ML_CLIENT_SECRET:
+        return None
+    if not force and _ml_app_token["token"] and _ml_app_token["expires_at"] > time.time() + 60:
+        return _ml_app_token["token"]
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            res = await client.post(
+                "https://api.mercadolibre.com/oauth/token",
+                json={
+                    "grant_type": "client_credentials",
+                    "client_id": ML_CLIENT_ID,
+                    "client_secret": ML_CLIENT_SECRET,
+                },
+            )
+            if res.status_code == 200:
+                data = res.json()
+                _ml_app_token["token"] = data.get("access_token")
+                _ml_app_token["expires_at"] = time.time() + int(data.get("expires_in", 21600)) - 300
+                return _ml_app_token["token"]
+    except Exception:
+        pass
+    return None
 
 try:
     from selectolax.parser import HTMLParser
@@ -18,7 +66,7 @@ except ImportError:
 
 ALLOWED_DOMAINS = [
     "mercadolibre.com.mx", "mercadolivre.com.br", "mercadolibre.com.ar",
-    "mercadolibre.cl", "mercadolibre.com.co", "mercadolibre.com.pe", 
+    "mercadolibre.cl", "mercadolibre.com.co", "mercadolibre.com.pe",
     "mercadolibre.com.uy", "mercadolibre.com.ec", "mercadolibre.com.ve"
 ]
 
@@ -28,170 +76,488 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 ]
 
+CURRENCY_SYMBOLS = {
+    "BRL": "R$", "ARS": "AR$", "MXN": "MX$", "CLP": "CLP$",
+    "COP": "COL$", "PEN": "S/", "UYU": "$U", "VES": "Bs.", "USD": "US$"
+}
+
+
 def clean_title_from_url(url: str) -> str:
+    """Extrae el título formateado directamente desde el enlace si el HTML viene bloqueado."""
     try:
-        path = url.split("mercadolivre.com.br/")[-1].split("mercadolibre.com.ar/")[-1].split("mercadolibre.com.mx/")[-1]
-        raw_slug = path.split("/p/")[0].split("/MLA")[0].split("/MLB")[0]
+        path = re.split(r"mercadol(?:ibre|ivre)\.[a-z.]+/", url)[-1]
+        raw_slug = re.split(r"/p/|/ML[A-Z]", path)[0]
         words = raw_slug.replace("-", " ").strip().split()
         return " ".join(word.capitalize() for word in words)
     except Exception:
         return "Producto Mercado Libre"
 
-def extract_item_id(url: str) -> tuple[str | None, str]:
+
+def extract_item_id(url: str) -> tuple[str | None, bool]:
     """
-    Retorna (id, site_id) ej: ('MLA53301314', 'MLA')
+    Retorna una tupla (item_id, is_catalog).
+    Si es /p/MLB123456 -> ('MLB123456', True)
+    Si es /MLB-123456 -> ('MLB123456', False)
     """
-    p_match = re.search(r'/(p/)?(ML[A-Z])[-_]?(\d+)', url)
+    p_match = re.search(r'/p/(ML[A-Z]-?[\d-]*\d)', url)
     if p_match:
-        site_prefix = p_match.group(2)
-        number_id = p_match.group(3)
-        return f"{site_prefix}{number_id}", site_prefix
-    return None, "MLA"
+        raw_id = p_match.group(1).replace("-", "")
+        return raw_id, True
+
+    item_match = re.search(r'/(ML[A-Z]-?\d+)', url)
+    if item_match:
+        raw_id = item_match.group(1).replace("-", "")
+        return raw_id, False
+
+    return None, False
+
 
 def get_headers() -> dict:
     return {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "es-AR,es-ES,es;q=0.9,pt-BR;q=0.8,en;q=0.7",
+        "Accept-Language": "pt-BR,pt;q=0.9,es-ES,es;q=0.8,en;q=0.7",
         "Cache-Control": "no-cache",
         "Upgrade-Insecure-Requests": "1"
     }
 
+
+def set_price_from_number(price_val, currency_code: str | None = None) -> tuple[str, str, str]:
+    """Convierte un precio numérico (float/int/str) en (integer, decimals, currency_symbol)."""
+    price_str = str(price_val)
+    if "." in price_str:
+        integer, decimals = price_str.split(".", 1)
+        decimals = (decimals + "00")[:2]
+    else:
+        integer, decimals = price_str, "00"
+    symbol = CURRENCY_SYMBOLS.get(currency_code or "", "")
+    return integer, decimals, symbol
+
+
+def parse_localized_price(text: str, default_currency: str) -> tuple[str, str, str]:
+    """
+    Parsea un precio formateado localmente, ej: '1.234,56' (BR/AR) o '1,234.56' (algunos casos MX).
+    Devuelve (integer_sin_separadores, decimales, simbolo_moneda_detectado_o_default).
+    """
+    text = text.strip()
+    # Detectar símbolo de moneda al inicio
+    symbol = default_currency
+    curr_match = re.match(r'^\s*(R\$|US\$|\$\$?|S\/|Bs\.?|CLP\$|COL\$|AR\$|MX\$)\s*', text)
+    if curr_match:
+        symbol = curr_match.group(1)
+        text = text[curr_match.end():]
+
+    nums = re.findall(r'[\d.,]+', text)
+    if not nums:
+        return "0", "00", symbol
+    num = nums[0]
+
+    integer, decimals = num, "00"
+    if "," in num and "." in num:
+        # El último separador es el decimal
+        if num.rfind(",") > num.rfind("."):
+            integer, decimals = num.rsplit(",", 1)
+            integer = integer.replace(".", "")
+        else:
+            integer, decimals = num.rsplit(".", 1)
+            integer = integer.replace(",", "")
+    elif "," in num:
+        tail = num.rsplit(",", 1)
+        if len(tail[1]) == 2:  # probable decimal
+            integer, decimals = tail[0].replace(".", "").replace(",", ""), tail[1]
+        else:
+            integer = num.replace(",", "")
+    elif "." in num:
+        tail = num.rsplit(".", 1)
+        # Un punto con 3 dígitos después suele ser separador de miles (AR/MX/CL)
+        if len(tail[1]) == 3:
+            integer = num.replace(".", "")
+        else:
+            integer, decimals = tail[0], (tail[1] + "00")[:2]
+    decimals = (decimals + "00")[:2]
+    return integer, decimals, symbol
+
+
+def extract_price_from_state_scripts(html: str) -> dict | None:
+    """
+    Busca el estado inicial de la PDP (React/Redux) embebido en <script> y extrae
+    el precio del objeto `availableQuantity`/`price` del componente de compra.
+    """
+    # Patrón típico: window.__PRELOADED_STATE__ = {...} ; o {"price":{...}} dentro del bundle de datos
+    candidates = re.findall(
+        r'"price"\s*:\s*\{[^{}]*?"amount"\s*:\s*([\d.]+)',
+        html
+    )
+    if candidates:
+        return {"amount": candidates[0]}
+
+    m = re.search(r'"buyBoxPrice"[^0-9]{0,80}([0-9]+(?:\.[0-9]{1,2})?)', html)
+    if m:
+        return {"amount": m.group(1)}
+
+    m = re.search(r'window\.__PRELOADED_STATE__\s*=\s*(\{.*?\});', html, re.DOTALL)
+    if m:
+        try:
+            data = json.loads(m.group(1))
+            stack = [data]
+            while stack:
+                node = stack.pop()
+                if isinstance(node, dict):
+                    if node.get("id") in ("AND_MONEY", "UI_ANDIS") and "content" in node:
+                        txt = re.sub(r'<[^>]+>', '', str(node["content"]))
+                        found = re.search(r'([\d.,]+\s*R?\$|R?\$\s*[\d.,]+|[A-Z]{3}\s*\$?\s*[\d.,]+)', txt)
+                        if found:
+                            return {"localized": found.group(1)}
+                    stack.extend(node.values())
+                elif isinstance(node, list):
+                    stack.extend(node)
+        except Exception:
+            pass
+    return None
+
+
+# --- CACHE EN MEMORIA (gratis, sin Redis) ---
+# Reduce drasticamente las peticiones a Mercado Libre y a la API oficial,
+# evitando que tu IP de Render sea bloqueada por exceso de requests.
+import time as _time
+from collections import OrderedDict
+
+CACHE_TTL_SECONDS = 6 * 3600   # el precio se conserva 6 horas
+CACHE_MAX_ITEMS = 500          # limite LRU (~0.5 MB de RAM)
+_price_cache: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+
+
+def cache_get(key: str) -> dict | None:
+    entry = _price_cache.get(key)
+    if not entry:
+        return None
+    ts, value = entry
+    if _time.time() - ts > CACHE_TTL_SECONDS:
+        _price_cache.pop(key, None)
+        return None
+    _price_cache.move_to_end(key)
+    return value
+
+
+def cache_set(key: str, value: dict) -> None:
+    _price_cache[key] = (_time.time(), value)
+    _price_cache.move_to_end(key)
+    while len(_price_cache) > CACHE_MAX_ITEMS:
+        _price_cache.popitem(last=False)
+
+
+def _extract_domain(url: str) -> str | None:
+    for d in ALLOWED_DOMAINS:
+        if d in url.lower():
+            return d
+    return None
+
+
+def _catalog_to_item_ids(data: dict) -> list[str]:
+    """IDs de publicaciones reales dentro de un producto de catalogo (/p/)."""
+    ids: list[str] = []
+    for key in ("sellers_states", "attributes"):
+        pass  # exploracion general abajo
+    candidates = json.dumps(data)[:200000]
+    for m in re.finditer(r'"(?:item_id|id)"\s*:\s*"?(ML[A-Z]-?\d+)"?', candidates):
+        raw = m.group(1).replace("-", "")
+        if raw not in ids:
+            ids.append(raw)
+    # fallback: extraer MLIDs del permalink y de sellers_states
+    perm = data.get("permalink") or ""
+    for s in (data.get("sellers_states") or []):
+        p = (s.get("seller") or {}).get("permalink") or s.get("permalink") or ""
+        if p:
+            perm = p
+            break
+    for m in re.finditer(r'(ML[A-Z]-?\d+)', perm):
+        raw = m.group(1).replace("-", "")
+        if raw not in ids:
+            ids.append(raw)
+    return ids[:5]
+
+
+async def fetch_from_official_api(url: str) -> dict | None:
+    """Ultimo recurso 100% gratis: API oficial de Mercado Libre.
+    Con credenciales usa app token; sin ellas intenta el modo publico.
+    Funciona incluso cuando la PDP esta bloqueada por anti-scraper."""
+    item_id, is_catalog = extract_item_id(url)
+    if not item_id:
+        return None
+
+    currency = "R$" if "mercadolivre.com.br" in url else "$"
+    seller = "Mercado Livre / Vendedor Oficial" if "mercadolivre.com.br" in url else "Mercado Libre / Vendedor Oficial"
+
+    tok = await get_ml_app_token()  # no-op si no hay credenciales
+
+    async with httpx.AsyncClient(timeout=8.0, headers=ml_headers()) as client:
+        try:
+            endpoint = f"https://api.mercadolibre.com/products/{item_id}" if is_catalog \
+                else f"https://api.mercadolibre.com/items/{item_id}"
+            api_res = await client.get(endpoint)
+
+            # --- Modo publico (sin credenciales): resolver catalogo via domains ---
+            if api_res.status_code == 403 and not tok and is_catalog:
+                dom = _extract_domain(url)
+                if dom:
+                    dres = await client.get(f"https://api.mercadolibre.com/sites/{dom}/domains/{item_id}")
+                    if dres.status_code == 200:
+                        ddata = dres.json()
+                        real_ids = [i.get("id") for i in (ddata.get("automatic_by_item") or []) if i.get("id")]
+                        if not real_ids:
+                            real_ids = _catalog_to_item_ids(ddata)
+                        for rid in real_ids[:3]:
+                            it = await client.get(f"https://api.mercadolibre.com/items/{rid}")
+                            if it.status_code == 200:
+                                api_res = it
+                                is_catalog = False
+                                break
+                    if api_res.status_code != 200:
+                        return None
+
+            if api_res.status_code != 200:
+                return None
+            data = api_res.json()
+
+            title = data.get("name") or data.get("title") or clean_title_from_url(url)
+            price_raw, curr_code = None, data.get("currency_id")
+
+            if is_catalog:
+                buy_box = data.get("buy_box_winner")
+                if buy_box and buy_box.get("price") is not None:
+                    price_raw = buy_box["price"]
+                elif data.get("price") is not None:
+                    price_raw = data["price"]
+
+                # Si el producto no tiene precio directo, tomamos el primer
+                # item real de sellers_states o del permalink y consultamos /items
+                if price_raw is None:
+                    states = data.get("sellers_states") or []
+                    perm = None
+                    for s in states:
+                        perm = (s.get("seller") or {}).get("permalink") or s.get("permalink")
+                        if perm:
+                            break
+                    if not perm:
+                        perm = data.get("permalink")
+                    if perm:
+                        # extraer MLID del permalink y pedir /items (mas barato que bajar el HTML)
+                        m = re.search(r'(ML[AZ]B?-?\d+)', perm or "")
+                        if m:
+                            it = await client.get(f"https://api.mercadolibre.com/items/{m.group(1).replace('-', '')}")
+                            if it.status_code == 200:
+                                idata = it.json()
+                                price_raw = idata.get("price")
+                                curr_code = idata.get("currency_id") or curr_code
+                                title = idata.get("title") or title
+            else:
+                price_raw = data.get("price")
+
+            if price_raw is None or str(price_raw) in ("0", ""):
+                return None
+
+            integer, decimals, sym = set_price_from_number(price_raw, curr_code)
+            if sym:
+                currency = sym
+
+            return {
+                "product_name": title,
+                "selling_price": f"{currency} {integer}.{decimals}",
+                "price_details": {"currency": currency, "integer": integer, "decimals": decimals},
+                "condition": data.get("condition", "Nuevo") or "Nuevo",
+                "seller_name": seller,
+                "url": url,
+                "source": "official_api"
+            }
+        except Exception:
+            return None
+
+
 async def fetch_pdp(url: str) -> dict:
     clean_url = url.split("?")[0] if "?" in url else url
-    
+
     if not any(domain in clean_url.lower() for domain in ALLOWED_DOMAINS):
         raise HTTPException(status_code=400, detail="URL no soportada. Ingrese una URL valida de Mercado Libre LATAM.")
 
-    html = ""
-    res_status = 200
+    cached = cache_get(clean_url)
+    if cached:
+        return {**cached, "cached": True}
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
         try:
             res = await client.get(url, headers=get_headers())
-            res_status = res.status_code
-            if res_status == 200:
-                html = res.text
-        except Exception:
-            res_status = 502
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Error de conexion al servidor: {str(e)}")
 
+    if res.status_code != 200:
+        # Si Meli bloqueo (403/429) o la pagina no existe (404), igualmente
+        # intentamos con la API oficial ANTES de rendirnos. La API publica
+        # /items suele seguir funcionando aunque la PDP este bloqueada.
+        if res.status_code in (403, 429, 404, 503):
+            fb = await fetch_from_official_api(clean_url)
+            if fb:
+                cache_set(clean_url, fb)
+                return fb
+        raise HTTPException(status_code=res.status_code, detail=f"No se pudo acceder a la pagina. Codigo HTTP: {res.status_code}")
+
+    html = res.text
     title = None
     currency = "R$" if "mercadolivre.com.br" in clean_url else "$"
     integer = "0"
     decimals = "00"
     seller = "Mercado Livre / Vendedor Oficial" if "mercadolivre.com.br" in clean_url else "Mercado Libre / Vendedor Oficial"
 
-    # 1. SCRAPING DIRECTO SI LA PÁGINA RESPONDIÓ SIN CAPTCHA
-    if res_status == 200 and html and "completá este paso" not in html and "Por segurança" not in html:
-        try:
-            json_ld_matches = re.findall(r'<script type="application/ld\+json">(.*?)</script>', html, re.DOTALL)
-            for json_str in json_ld_matches:
-                data = json.loads(json_str.strip())
-                if isinstance(data, list):
-                    data = data[0] if len(data) > 0 else {}
-                
-                if data.get("@type") == "Product" or "offers" in data:
-                    if "name" in data and data["name"]:
-                        title = data["name"]
-                    
-                    offers = data.get("offers", {})
-                    if isinstance(offers, list) and len(offers) > 0:
-                        offers = offers[0]
-                    
-                    price_val = str(offers.get("price", "0"))
-                    if price_val != "0" and price_val != "":
-                        parts = price_val.split(".")
-                        integer = parts[0]
-                        decimals = parts[1] if len(parts) > 1 else "00"
-                        if len(decimals) == 1:
-                            decimals += "0"
-                    
-                    if offers.get("priceCurrency"):
-                        curr_code = offers.get("priceCurrency")
-                        currency = "R$" if curr_code == "BRL" else ("$" if curr_code in ["ARS", "MXN", "CLP", "COP"] else curr_code)
-                    break
-        except Exception:
-            pass
+    # --- MÉTODO 1: Extracción vía JSON-LD (Estructura estándar Schema.org) ---
+    try:
+        json_ld_matches = re.findall(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', html, re.DOTALL)
+        for json_str in json_ld_matches:
+            data = json.loads(json_str.strip())
+            if isinstance(data, list):
+                data = data[0] if len(data) > 0 else {}
 
-        if integer == "0" or not title:
-            if USE_SELECTOLAX:
-                tree = HTMLParser(html)
+            if data.get("@type") == "Product" or "offers" in data:
+                if "name" in data and data["name"]:
+                    title = data["name"]
+
+                offers = data.get("offers", {})
+                if isinstance(offers, list) and len(offers) > 0:
+                    offers = offers[0]
+
+                # FIX: los campos reales son "price" o "lowPrice"/"highPrice" según el feed
+                price_val = offers.get("price") or offers.get("lowPrice") or offers.get("highPrice")
+                if price_val is not None and str(price_val) not in ("0", ""):
+                    integer, decimals = parse_localized_price(str(price_val), currency)[:2]
+                    # parse_localized_price maneja tanto "123.45" como formatos locales
+
+                if offers.get("priceCurrency"):
+                    currency = CURRENCY_SYMBOLS.get(offers["priceCurrency"], offers["priceCurrency"])
+                break
+    except Exception:
+        pass
+
+    # --- MÉTODO 2: Parsing de HTML mediante Selectores CSS si JSON-LD falla ---
+    if integer == "0" or not title or "Por segurança" in str(title):
+        if USE_SELECTOLAX:
+            tree = HTMLParser(html)
+
+            if not title or "Por segurança" in str(title):
                 t_node = tree.css_first("h1.ui-pdp-title") or tree.css_first("h1.poly-component__title") or tree.css_first("h1")
-                if t_node and t_node.text(strip=True):
+                if t_node and t_node.text(strip=True) and "Por segurança" not in t_node.text(strip=True):
                     title = t_node.text(strip=True)
 
-                i_node = tree.css_first("span.andes-money-amount__fraction") or tree.css_first(".andes-money-amount__fraction")
+            if integer == "0":
+                i_node = (
+                    tree.css_first(".ui-pdp-price__second-line span.andes-money-amount__fraction") or
+                    tree.css_first("span.andes-money-amount__fraction") or
+                    tree.css_first(".andes-money-amount__fraction")
+                )
                 if i_node:
                     integer = i_node.text(strip=True)
 
-                d_node = tree.css_first("span.andes-money-amount__cents") or tree.css_first(".andes-money-amount__cents")
+                d_node = (
+                    tree.css_first(".ui-pdp-price__second-line span.andes-money-amount__cents") or
+                    tree.css_first("span.andes-money-amount__cents") or
+                    tree.css_first(".andes-money-amount__cents")
+                )
                 if d_node:
                     decimals = d_node.text(strip=True)
 
-                s_node = tree.css_first(".ui-pdp-seller__link-trigger") or tree.css_first(".ui-seller-info__title")
-                if s_node and s_node.text(strip=True):
-                    seller = s_node.text(strip=True)
+            s_node = tree.css_first(".ui-pdp-seller__link-trigger") or tree.css_first(".ui-seller-info__title")
+            if s_node and s_node.text(strip=True):
+                seller = s_node.text(strip=True)
 
-    # 2. RESPALDO ANTI-BLOQUEO: CONSULTA A LA API OFICIAL DE MERCADO LIBRE
-    if integer == "0" or integer == "" or not title or "completá este paso" in str(title) or "Por segurança" in str(title):
-        item_id, site_id = extract_item_id(url)
-        clean_title = clean_title_from_url(url)
-        if not title or "completá este paso" in str(title) or "Por segurança" in str(title):
-            title = clean_title
+        else:
+            soup = BeautifulSoup(html, "html.parser")
+            if not title or "Por segurança" in str(title):
+                t_node = soup.select_one("h1.ui-pdp-title") or soup.select_one("h1.poly-component__title") or soup.select_one("h1")
+                if t_node and t_node.get_text(strip=True) and "Por segurança" not in t_node.get_text(strip=True):
+                    title = t_node.get_text(strip=True)
 
+            if integer == "0":
+                i_node = soup.select_one("span.andes-money-amount__fraction") or soup.select_one(".andes-money-amount__fraction")
+                if i_node:
+                    integer = i_node.get_text(strip=True)
+
+                d_node = soup.select_one("span.andes-money-amount__cents") or soup.select_one(".andes-money-amount__cents")
+                if d_node:
+                    decimals = d_node.get_text(strip=True)
+
+            s_node = soup.select_one(".ui-pdp-seller__link-trigger") or soup.select_one(".ui-seller-info__title")
+            if s_node and s_node.get_text(strip=True):
+                seller = s_node.get_text(strip=True)
+
+    # --- MÉTODO 2.5: Estado embebido de la PDP (scripts React/Redux) ---
+    if integer == "0":
+        state_price = extract_price_from_state_scripts(html)
+        if state_price:
+            if "amount" in state_price:
+                integer, decimals, sym = set_price_from_number(state_price["amount"], None)
+                if sym:
+                    currency = sym
+            elif "localized" in state_price:
+                integer, decimals, currency = parse_localized_price(state_price["localized"], currency)
+
+    # Fallback si el título vino vacío o con mensaje de bloqueo
+    if not title or "Por segurança" in title or "Seguridad" in title:
+        title = clean_title_from_url(url)
+
+    # --- MÉTODO 3: Fallback con la API Oficial de Mercado Libre ---
+    # FIX: ahora también se usa cuando el JSON-LD devolvio titulo pero NO precio
+    # (los items "stopped"/inactivos omiten la oferta en JSON-LD).
+    if integer in ("0", ""):
+        item_id, is_catalog = extract_item_id(url)
         if item_id:
             async with httpx.AsyncClient(timeout=8.0) as client:
                 try:
-                    # A. Probar con API de productos de catálogo (/products/...)
-                    prod_res = await client.get(f"https://api.mercadolibre.com/products/{item_id}")
-                    if prod_res.status_code == 200:
-                        p_data = prod_res.json()
-                        if "name" in p_data and p_data["name"]:
-                            title = p_data["name"]
-                        buy_box = p_data.get("buy_box_winner")
-                        if buy_box and "price" in buy_box:
-                            price_val = str(buy_box["price"])
-                            parts = price_val.split(".")
-                            integer = parts[0]
-                            decimals = parts[1] if len(parts) > 1 else "00"
-                            if len(decimals) == 1:
-                                decimals += "0"
+                    if is_catalog:
+                        api_res = await client.get(f"https://api.mercadolibre.com/products/{item_id}")
+                        if api_res.status_code == 200:
+                            data = api_res.json()
+                            if data.get("name"):
+                                title = data["name"]
+
+                            buy_box = data.get("buy_box_winner")
+                            price_raw = None
+                            curr_code = data.get("currency_id")
+                            if buy_box and buy_box.get("price") is not None:
+                                price_raw = buy_box["price"]
+                            elif data.get("price") is not None:
+                                price_raw = data["price"]
+                            elif data.get("permalink"):
+                                # Sin buy box: resolver al item del permalink
+                                sub = await client.get(f"https://api.mercadolibre.com/items/{item_id}")
+                                if sub.status_code == 200:
+                                    sd = sub.json()
+                                    price_raw = sd.get("price")
+                                    curr_code = sd.get("currency_id") or curr_code
+
+                            if price_raw is not None and str(price_raw) not in ("0", ""):
+                                integer, decimals, sym = set_price_from_number(price_raw, curr_code)
+                                if sym:
+                                    currency = sym
                     else:
-                        # B. Probar con API de ítems (/items/...)
                         item_res = await client.get(f"https://api.mercadolibre.com/items/{item_id}")
                         if item_res.status_code == 200:
-                            i_data = item_res.json()
-                            if "title" in i_data and i_data["title"]:
-                                title = i_data["title"]
-                            price_val = str(i_data.get("price", "0"))
-                            parts = price_val.split(".")
-                            integer = parts[0]
-                            decimals = parts[1] if len(parts) > 1 else "00"
-                            if len(decimals) == 1:
-                                decimals += "0"
-                        else:
-                            # C. Búsqueda por palabras clave del título en la API del sitio correspondiente
-                            search_q = clean_title.replace(" ", "%20")
-                            search_res = await client.get(f"https://api.mercadolibre.com/sites/{site_id}/search?q={search_q}&limit=1")
-                            if search_res.status_code == 200:
-                                s_data = search_res.json()
-                                results = s_data.get("results", [])
-                                if results:
-                                    first_item = results[0]
-                                    if not title or title == "Producto Mercado Libre":
-                                        title = first_item.get("title", title)
-                                    price_val = str(first_item.get("price", "0"))
-                                    parts = price_val.split(".")
-                                    integer = parts[0]
-                                    decimals = parts[1] if len(parts) > 1 else "00"
-                                    if len(decimals) == 1:
-                                        decimals += "0"
+                            data = item_res.json()
+                            if data.get("title"):
+                                title = data["title"]
+                            price_raw = data.get("price")
+                            curr_code = data.get("currency_id")
+                            if price_raw is not None and str(price_raw) not in ("0", ""):
+                                integer, decimals, sym = set_price_from_number(price_raw, curr_code)
+                                if sym:
+                                    currency = sym
                 except Exception:
                     pass
 
-    integer = integer.replace(".", "").replace(",", "")
+    # FIX CRÍTICO: antes esto era replace(".", "") lo que DESTRUIA los decimales
+    # cuando el entero venía del JSON-LD ("1234.56" -> "123456"). Ahora solo
+    # se limpian separadores de miles, conservando el valor correcto.
+    integer, decimals = parse_localized_price(f"{integer},{decimals}" if "." not in integer and len(decimals) == 2 else f"{integer}.{decimals}", currency)[:2]
+    # Normalizar: quitar separadores de miles residuales del entero
+    integer = re.sub(r'[.,]', '', integer) if ("," in integer or ("." in integer and len(integer.split(".")[-1]) == 3)) else integer.replace(",", "")
 
-    return {
+    result = {
         "product_name": title,
         "selling_price": f"{currency} {integer}.{decimals}",
         "price_details": {
@@ -204,22 +570,112 @@ async def fetch_pdp(url: str) -> dict:
         "url": url
     }
 
+    # Solo cacheamos si realmente obtuvimos un precio valido
+    if integer and integer != "0":
+        cache_set(clean_url, result)
+
+    return result
+
+
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "Mercado Libre Scraper API esta activa y funcionando."}
+
+# Health check para Render (Render -> Settings -> Health Check Path = /health)
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
 
 @app.get("/v1/latam/scrape", summary="Scraper Universal LATAM")
 async def scrape_latam(url: str = Query(..., description="URL completa del producto de Mercado Libre")):
     return await fetch_pdp(url)
 
+
 @app.get("/v1/mx/scrape", summary="Mercado Libre Mexico")
 async def scrape_mx(url: str = Query(...)):
     return await fetch_pdp(url)
+
 
 @app.get("/v1/br/scrape", summary="Mercado Livre Brasil")
 async def scrape_br(url: str = Query(...)):
     return await fetch_pdp(url)
 
+
 @app.get("/v1/ar/scrape", summary="Mercado Libre Argentina")
 async def scrape_ar(url: str = Query(...)):
     return await fetch_pdp(url)
+
+
+# --- Diagnóstico y OAuth opcional ---
+
+@app.get("/v1/ml/status", summary="Estado del token de la API oficial")
+async def ml_status():
+    tok = _ml_app_token["token"]
+    if ML_CLIENT_ID and (not tok or _ml_app_token["expires_at"] <= time.time()):
+        tok = await get_ml_app_token(force=True)
+    return {
+        "credentials_configured": bool(ML_CLIENT_ID and ML_CLIENT_SECRET),
+        "app_token_active": bool(tok),
+        "token_prefix": (tok[:12] + "...") if tok else None,
+        "expires_in_seconds": max(0, int(_ml_app_token["expires_at"] - time.time())) if tok else 0,
+    }
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+# Guardamos temporalmente el state/verifier mientras el usuario autoriza en Meli
+_oauth_pending: dict = {}
+
+
+@app.get("/v1/ml/auth/login", summary="Iniciar autorizacion de usuario (opcional)")
+async def ml_auth_login():
+    """Genera la URL para que un vendedor/usuario autorice tu app (scope read_only).
+    Solo necesario si quieres datos privados (sus publicaciones, ventas, etc.)."""
+    if not ML_CLIENT_ID or not ML_REDIRECT_URI:
+        raise HTTPException(status_code=400, detail="Faltan ML_CLIENT_ID / ML_REDIRECT_URI")
+    import secrets
+    verifier = _b64url(secrets.token_bytes(32))
+    challenge = _b64url(__import__("hashlib").sha256(verifier.encode()).digest())
+    state = _b64url(secrets.token_bytes(16))
+    _oauth_pending["state"] = {"verifier": verifier, "state": state}
+    params = urllib.parse.urlencode({
+        "response_type": "code",
+        "client_id": ML_CLIENT_ID,
+        "redirect_uri": ML_REDIRECT_URI,
+        "scope": "offline_access read_only",
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    })
+    return {"authorization_url": f"https://auth.mercadolibre.com/authorization?{params}"}
+
+
+@app.get("/v1/ml/auth/callback", summary="Callback OAuth (lo llama Meli tras autorizar)")
+async def ml_auth_callback(code: str = Query(...), state: str = Query("")):
+    """Intercambia el code por un user token (se guarda en memoria; en produccion
+    persistelo en una variable de entorno o archivo seguro)."""
+    pending = _oauth_pending.get("state")
+    if not pending or (state and state != pending["state"]):
+        raise HTTPException(status_code=400, detail="State invalido, reintenta /v1/ml/auth/login")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        res = await client.post("https://api.mercadolibre.com/oauth/token", json={
+            "grant_type": "authorization_code",
+            "client_id": ML_CLIENT_ID,
+            "client_secret": ML_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": ML_REDIRECT_URI,
+            "code_verifier": pending["verifier"],
+        })
+    if res.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Error intercambiando code: {res.text}")
+    data = res.json()
+    return {
+        "user_id": data.get("user_id"),
+        "access_token": data.get("access_token"),
+        "refresh_token": data.get("refresh_token"),
+        "expires_in": data.get("expires_in"),
+        "note": "Guarda access_token como env var ML_USER_TOKEN en Render y borra este mensaje.",
+    }
