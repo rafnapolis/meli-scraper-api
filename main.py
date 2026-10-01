@@ -10,7 +10,7 @@ import httpx
 
 app = FastAPI(
     title="Mercado Libre LATAM Scraper API",
-    version="2.10.0"
+    version="2.12.0"
 )
 
 # --- Credenciales de la API oficial (configurar como Secret Env Vars en Render) ---
@@ -134,6 +134,34 @@ def set_price_from_number(price_val, currency_code: str | None = None) -> tuple[
     return integer, decimals, symbol
 
 
+def normalize_integer_decimals(integer: str, decimals: str) -> tuple[str, str]:
+    """FIX v2.12.0: normaliza el par (entero, decimales) sin destruir valores.
+
+    - Quita separadores de miles del entero ("1.234"->"1234", "1,234"->"1234").
+    - Si el entero llega con punto y 1-2 decimales ("1234.56"), los mueve a `decimals`.
+    - Un punto con 3 dígitos después se trata como separador de miles (AR/MX/CL),
+      NO como decimal, para no truncar mal precios como "95.990".
+    """
+    integer = str(integer).strip()
+    decimals = str(decimals).strip()
+
+    if "." in integer:
+        head, tail = integer.rsplit(".", 1)
+        if tail.isdigit() and len(tail) <= 2:
+            # era un decimal real: "1234.56"
+            integer, decimals = head, (tail + "00")[:2]
+        else:
+            # separador de miles: "1.234" / "95.990"
+            integer = integer.replace(".", "")
+    integer = integer.replace(",", "").replace(" ", "")
+
+    if not decimals or decimals == "None":
+        decimals = "00"
+    decimals = re.sub(r"\D", "", decimals)
+    decimals = (decimals + "00")[:2]
+    return integer, decimals
+
+
 def parse_localized_price(text: str, default_currency: str) -> tuple[str, str, str]:
     """
     Parsea un precio formateado localmente, ej: '1.234,56' (BR/AR) o '1,234.56' (algunos casos MX).
@@ -253,11 +281,27 @@ def _extract_domain(url: str) -> str | None:
     return None
 
 
+def _site_id_from_url(url: str) -> str | None:
+    """Deriva el site_id (MLA, MLB, MLM...) desde el dominio o el prefijo del MLID."""
+    m = re.search(r'ML([A-Z]{2})', url)
+    if m:
+        return "ML" + m.group(1)
+    domain_map = {
+        "mercadolibre.com.mx": "MLM", "mercadolivre.com.br": "MLB",
+        "mercadolibre.com.ar": "MLA", "mercadolibre.cl": "MLC",
+        "mercadolibre.com.co": "MCO", "mercadolibre.com.pe": "MPE",
+        "mercadolibre.com.uy": "MUy", "mercadolibre.com.ec": "MEC",
+        "mercadolibre.com.ve": "MLV",
+    }
+    for d, s in domain_map.items():
+        if d in url.lower():
+            return s
+    return None
+
+
 def _catalog_to_item_ids(data: dict) -> list[str]:
     """IDs de publicaciones reales dentro de un producto de catalogo (/p/)."""
     ids: list[str] = []
-    for key in ("sellers_states", "attributes"):
-        pass  # exploracion general abajo
     candidates = json.dumps(data)[:200000]
     for m in re.finditer(r'"(?:item_id|id)"\s*:\s*"?(ML[A-Z]-?\d+)"?', candidates):
         raw = m.group(1).replace("-", "")
@@ -299,21 +343,37 @@ async def fetch_from_official_api(url: str) -> dict | None:
             # --- Modo publico (sin credenciales): resolver catalogo via domains ---
             if api_res.status_code == 403 and not tok and is_catalog:
                 dom = _extract_domain(url)
-                if dom:
-                    dres = await client.get(f"https://api.mercadolibre.com/sites/{dom}/domains/{item_id}")
-                    if dres.status_code == 200:
-                        ddata = dres.json()
-                        real_ids = [i.get("id") for i in (ddata.get("automatic_by_item") or []) if i.get("id")]
-                        if not real_ids:
-                            real_ids = _catalog_to_item_ids(ddata)
-                        for rid in real_ids[:3]:
-                            it = await client.get(f"https://api.mercadolibre.com/items/{rid}")
-                            if it.status_code == 200:
-                                api_res = it
-                                is_catalog = False
-                                break
-                    if api_res.status_code != 200:
-                        return None
+                site = _site_id_from_url(url)
+                dres = None
+                if site:
+                    dres = await client.get(f"https://api.mercadolibre.com/sites/{site}/domains/{item_id}")
+                if dres and dres.status_code == 200:
+                    ddata = dres.json()
+                    real_ids = [i.get("id") for i in (ddata.get("automatic_by_item") or []) if i.get("id")]
+                    if not real_ids:
+                        real_ids = _catalog_to_item_ids(ddata)
+                    for rid in real_ids[:3]:
+                        it = await client.get(f"https://api.mercadolibre.com/items/{rid}")
+                        if it.status_code == 200:
+                            api_res = it
+                            is_catalog = False
+                            break
+
+                # FIX v2.12.0: si /domains tampoco responde, usar el wid del query
+                # de la URL de busqueda (ej: ...&wid=MLA3993223402&sid=search).
+                # El wid es la PUBLICACION real que Meli mostro en ese resultado,
+                # y /items/MLS-... con id de publicacion funciona sin token.
+                if api_res.status_code != 200:
+                    wid_match = re.search(r'[?&#]wid=(ML[A-Z]-?\d+)', url)
+                    if wid_match:
+                        wid = wid_match.group(1).replace("-", "")
+                        it = await client.get(f"https://api.mercadolibre.com/items/{wid}")
+                        if it.status_code == 200:
+                            api_res = it
+                            is_catalog = False
+
+                if api_res.status_code != 200:
+                    return None
 
             if api_res.status_code != 200:
                 return None
@@ -373,8 +433,23 @@ async def fetch_from_official_api(url: str) -> dict | None:
             return None
 
 
+BLOCK_PATTERNS = (
+    "Por segurança", "completá este paso", "Completa este paso",
+    "captcha", "verificación", "no somos un robot", "Parece que eres un robot"
+)
+
+
+def looks_blocked(title, integer: str) -> bool:
+    """Detecta si la PDP devolvio 200 pero con pantalla anti-bot/captcha."""
+    t = str(title or "")
+    return integer in ("0", "") and any(p.lower() in t.lower() for p in BLOCK_PATTERNS)
+
+
 async def fetch_pdp(url: str) -> dict:
-    clean_url = url.split("?")[0] if "?" in url else url
+    # FIX v2.11.0: limpiar query string Y fragmento (#polycard_client=...&wid=...)
+    # Las URLs de busqueda de Meli traen el item real en /p/MLAxxx y basura
+    # despues del '#'; se la pasabamos completa a Meli y disparaba el captcha.
+    clean_url = re.split(r'[?#]', url)[0]
 
     if not any(domain in clean_url.lower() for domain in ALLOWED_DOMAINS):
         raise HTTPException(status_code=400, detail="URL no soportada. Ingrese una URL valida de Mercado Libre LATAM.")
@@ -385,7 +460,8 @@ async def fetch_pdp(url: str) -> dict:
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
         try:
-            res = await client.get(url, headers=get_headers())
+            # FIX: pedir la URL LIMPIA (sin query ni fragmento), no la original
+            res = await client.get(clean_url, headers=get_headers())
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Error de conexion al servidor: {str(e)}")
 
@@ -415,7 +491,7 @@ async def fetch_pdp(url: str) -> dict:
             if isinstance(data, list):
                 data = data[0] if len(data) > 0 else {}
 
-            if data.get("@type") == "Product" or "offers" in data:
+            if data.get("@type") == "Product" or "offers" in 
                 if "name" in data and data["name"]:
                     title = data["name"]
 
@@ -497,65 +573,35 @@ async def fetch_pdp(url: str) -> dict:
             elif "localized" in state_price:
                 integer, decimals, currency = parse_localized_price(state_price["localized"], currency)
 
-    # Fallback si el título vino vacío o con mensaje de bloqueo
-    if not title or "Por segurança" in title or "Seguridad" in title:
-        title = clean_title_from_url(url)
+    # Fallback si el título vino vacío o con mensaje de bloqueo (ES o PT)
+    if not title or "seguridad" in str(title).lower() or "segurança" in str(title).lower():
+        title = clean_title_from_url(clean_url)
 
     # --- MÉTODO 3: Fallback con la API Oficial de Mercado Libre ---
-    # FIX: ahora también se usa cuando el JSON-LD devolvio titulo pero NO precio
-    # (los items "stopped"/inactivos omiten la oferta en JSON-LD).
+    # FIX v2.11.0: se activa SIEMPRE que no obtuvimos precio, incluso cuando
+    # la PDP devolvio 200 pero con pantalla anti-bot ("Por seguridad, completá
+    # este paso"). Antes solo se usaba en errores HTTP y Meli responde el
+    # captcha con status 200, por eso te quedabas con $ 0.00.
     if integer in ("0", ""):
-        item_id, is_catalog = extract_item_id(url)
-        if item_id:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                try:
-                    if is_catalog:
-                        api_res = await client.get(f"https://api.mercadolibre.com/products/{item_id}")
-                        if api_res.status_code == 200:
-                            data = api_res.json()
-                            if data.get("name"):
-                                title = data["name"]
+        # FIX v2.12.0: pasar la URL ORIGINAL (con query) porque el parametro
+        # &wid=MLAxxx que traen los links de busqueda contiene la PUBLICACION
+        # real; si recortabamos el query se perdia y el catalogo /p/ no podia
+        # resolverse sin token. clean_url sigue usandose para key de cache.
+        fb = await fetch_from_official_api(url)
+        if fb:
+            cache_set(clean_url, fb)
+            return fb
 
-                            buy_box = data.get("buy_box_winner")
-                            price_raw = None
-                            curr_code = data.get("currency_id")
-                            if buy_box and buy_box.get("price") is not None:
-                                price_raw = buy_box["price"]
-                            elif data.get("price") is not None:
-                                price_raw = data["price"]
-                            elif data.get("permalink"):
-                                # Sin buy box: resolver al item del permalink
-                                sub = await client.get(f"https://api.mercadolibre.com/items/{item_id}")
-                                if sub.status_code == 200:
-                                    sd = sub.json()
-                                    price_raw = sd.get("price")
-                                    curr_code = sd.get("currency_id") or curr_code
+    # Si aun asi no hay precio, devolver datos honestos con bandera de aviso
+    warning = None
+    if integer in ("0", ""):
+        warning = ("No se pudo obtener el precio: la pagina anti-bot de Meli bloquee "
+                   "y la API oficial tampoco devolvio oferta (producto inactivo o sin credenciales).")
 
-                            if price_raw is not None and str(price_raw) not in ("0", ""):
-                                integer, decimals, sym = set_price_from_number(price_raw, curr_code)
-                                if sym:
-                                    currency = sym
-                    else:
-                        item_res = await client.get(f"https://api.mercadolibre.com/items/{item_id}")
-                        if item_res.status_code == 200:
-                            data = item_res.json()
-                            if data.get("title"):
-                                title = data["title"]
-                            price_raw = data.get("price")
-                            curr_code = data.get("currency_id")
-                            if price_raw is not None and str(price_raw) not in ("0", ""):
-                                integer, decimals, sym = set_price_from_number(price_raw, curr_code)
-                                if sym:
-                                    currency = sym
-                except Exception:
-                    pass
-
-    # FIX CRÍTICO: antes esto era replace(".", "") lo que DESTRUIA los decimales
-    # cuando el entero venía del JSON-LD ("1234.56" -> "123456"). Ahora solo
-    # se limpian separadores de miles, conservando el valor correcto.
-    integer, decimals = parse_localized_price(f"{integer},{decimals}" if "." not in integer and len(decimals) == 2 else f"{integer}.{decimals}", currency)[:2]
-    # Normalizar: quitar separadores de miles residuales del entero
-    integer = re.sub(r'[.,]', '', integer) if ("," in integer or ("." in integer and len(integer.split(".")[-1]) == 3)) else integer.replace(",", "")
+    # FIX v2.12.0: normalizacion segura del par (entero, decimales).
+    # Reemplaza el antiguo replace(".", "") que destruia los decimales del
+    # JSON-LD y no limpiaba separadores de miles localizados ("1.234" AR/BR).
+    integer, decimals = normalize_integer_decimals(integer, decimals)
 
     result = {
         "product_name": title,
@@ -567,7 +613,9 @@ async def fetch_pdp(url: str) -> dict:
         },
         "condition": "Nuevo",
         "seller_name": seller,
-        "url": url
+        "url": url,
+        "source": "pdp_html",
+        "warning": warning
     }
 
     # Solo cacheamos si realmente obtuvimos un precio valido
