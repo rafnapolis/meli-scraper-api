@@ -362,7 +362,7 @@ async def fetch_from_official_api(url: str) -> dict | None:
                 # FIX v2.12.0: si /domains tampoco responde, usar el wid del query
                 # de la URL de busqueda (ej: ...&wid=MLA3993223402&sid=search).
                 # El wid es la PUBLICACION real que Meli mostro en ese resultado,
-                # y /items/MLS-... con id de publicacion funciona sin token.
+                # y /items/MLA... con id de publicacion funciona sin token.
                 if api_res.status_code != 200:
                     wid_match = re.search(r'[?&#]wid=(ML[A-Z]-?\d+)', url)
                     if wid_match:
@@ -491,7 +491,7 @@ async def fetch_pdp(url: str) -> dict:
             if isinstance(data, list):
                 data = data[0] if len(data) > 0 else {}
 
-            if data.get("@type") == "Product" or "offers" in 
+            if data.get("@type") == "Product" or "offers" in data:
                 if "name" in data and data["name"]:
                     title = data["name"]
 
