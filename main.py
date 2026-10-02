@@ -686,7 +686,7 @@ async def ml_status():
     }
 
 
-def _b64url(data: bytes) -> str:
+def _b64url( bytes) -> str:
     return base64.urlsafe_b64encode(data).decode().rstrip("=")
 
 
