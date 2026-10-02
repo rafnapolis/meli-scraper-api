@@ -10,8 +10,10 @@ import httpx
 
 app = FastAPI(
     title="Mercado Libre LATAM Scraper API",
-    version="2.12.0"
+    version="2.13.0"
 )
+
+_START_TIME = time.time()
 
 # --- Credenciales de la API oficial (configurar como Secret Env Vars en Render) ---
 ML_CLIENT_ID = os.getenv("ML_CLIENT_ID", "")
@@ -362,7 +364,7 @@ async def fetch_from_official_api(url: str) -> dict | None:
                 # FIX v2.12.0: si /domains tampoco responde, usar el wid del query
                 # de la URL de busqueda (ej: ...&wid=MLA3993223402&sid=search).
                 # El wid es la PUBLICACION real que Meli mostro en ese resultado,
-                # y /items/MLA... con id de publicacion funciona sin token.
+                # y /items/MLS-... con id de publicacion funciona sin token.
                 if api_res.status_code != 200:
                     wid_match = re.search(r'[?&#]wid=(ML[A-Z]-?\d+)', url)
                     if wid_match:
@@ -491,7 +493,7 @@ async def fetch_pdp(url: str) -> dict:
             if isinstance(data, list):
                 data = data[0] if len(data) > 0 else {}
 
-            if data.get("@type") == "Product" or "offers" in data:
+            if data.get("@type") == "Product" or "offers" in 
                 if "name" in data and data["name"]:
                     title = data["name"]
 
@@ -629,10 +631,24 @@ async def fetch_pdp(url: str) -> dict:
 async def root():
     return {"status": "ok", "message": "Mercado Libre Scraper API esta activa y funcionando."}
 
-# Health check para Render (Render -> Settings -> Health Check Path = /health)
+# Health check para Render y keep-alive de UptimeRobot.
+# Render -> Settings -> Health Check Path = /health
+# UptimeRobot -> URL monitor publico apuntando a https://tu-app.onrender.com/health
+# Nota: /health es intencionalmente barato (sin acceso a red ni disco) para
+# poder golpearlo cada 5 minutos sin gastar requests hacia Mercado Libre.
+_keepalive_log: dict = {"last_hit": 0.0, "total_hits": 0}
+
+
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    _keepalive_log["last_hit"] = time.time()
+    _keepalive_log["total_hits"] += 1
+    return {
+        "status": "healthy",
+        "uptime_seconds": int(time.time() - _START_TIME),
+        "keepalive_hits": _keepalive_log["total_hits"],
+        "cache_size": len(_price_cache),
+    }
 
 
 @app.get("/v1/latam/scrape", summary="Scraper Universal LATAM")
