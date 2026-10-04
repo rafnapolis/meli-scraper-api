@@ -10,13 +10,13 @@ from fastapi import FastAPI, HTTPException, Query
 import httpx
 from collections import OrderedDict
 
-# Configurar logging básico para monitoreo en Render
+# Configurar logging básico para monitoreo en Render/RapidAPI
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Mercado Libre LATAM Scraper API",
-    version="2.14.0"
+    version="2.15.0"
 )
 
 _START_TIME = time.time()
@@ -24,7 +24,7 @@ _START_TIME = time.time()
 # --- Credenciales de la API oficial (configurar como Secret Env Vars en Render) ---
 ML_CLIENT_ID = os.getenv("ML_CLIENT_ID", "")
 ML_CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET", "")
-ML_REDIRECT_URI = os.getenv("ML_REDIRECT_URI", "")  # opcional, solo para flujo user
+ML_REDIRECT_URI = os.getenv("ML_REDIRECT_URI", "")
 
 # Token de aplicacion (client_credentials) con refresh automatico
 _ml_app_token: dict = {"token": None, "expires_at": 0.0}
@@ -40,7 +40,7 @@ def ml_headers() -> dict:
 
 
 async def get_ml_app_token(force: bool = False) -> str | None:
-    """Obtiene access_token de app publica via client_credentials (gratis, sin login usuario)."""
+    """Obtiene access_token de app publica via client_credentials."""
     if not ML_CLIENT_ID or not ML_CLIENT_SECRET:
         return None
     if not force and _ml_app_token["token"] and _ml_app_token["expires_at"] > time.time() + 60:
@@ -104,16 +104,19 @@ def clean_title_from_url(url: str) -> str:
 
 
 def extract_item_id(url: str) -> tuple[str | None, bool]:
-    """Retorna una tupla (item_id, is_catalog)."""
-    p_match = re.search(r'/p/(ML[A-Z]-?[\d-]*\d)', url)
+    """
+    Retorna una tupla (item_id, is_catalog).
+    Versión mejorada: busca el patrón ML[PAIS] en cualquier parte de la URL.
+    """
+    # 1. Buscar si es catálogo (/p/MLA...)
+    p_match = re.search(r'/p/(ML[A-Z]{2}-?\d+)', url)
     if p_match:
-        raw_id = p_match.group(1).replace("-", "")
-        return raw_id, True
+        return p_match.group(1).replace("-", ""), True
 
-    item_match = re.search(r'/(ML[A-Z]-?\d+)', url)
+    # 2. Buscar CUALQUIER ID de publicación en la URL (ignora tracking params)
+    item_match = re.search(r'(ML[A-Z]{2}-?\d+)', url)
     if item_match:
-        raw_id = item_match.group(1).replace("-", "")
-        return raw_id, False
+        return item_match.group(1).replace("-", ""), False
 
     return None, False
 
@@ -229,6 +232,28 @@ def extract_price_from_state_scripts(html: str) -> dict | None:
     return None
 
 
+def extract_price_from_deep_scripts(html: str) -> dict | None:
+    """
+    NUEVO: Busca precios en variables de JavaScript de forma más agresiva.
+    Captura regular_price, price, y estructuras de buybox que ML usa actualmente.
+    """
+    scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
+    for script in scripts:
+        # Patrón 1: "regular_price": 1234.56 o "price": 1234.56
+        match_price = re.search(r'"(?:regular_price|price)"\s*:\s*([\d.]+)', script)
+        if match_price:
+            val = match_price.group(1)
+            if len(val) > 3: # Un precio real suele tener más de 3 dígitos o decimales
+                return {"amount": val}
+        
+        # Patrón 2: Estructura de buybox de ML ("listing": {"price": ...})
+        match_buybox = re.search(r'"buybox"\s*:\s*\{[^}]*?"price"\s*:\s*([\d.]+)', script)
+        if match_buybox:
+            return {"amount": match_buybox.group(1)}
+            
+    return None
+
+
 # --- CACHE EN MEMORIA ---
 CACHE_TTL_SECONDS = 6 * 3600
 CACHE_MAX_ITEMS = 500
@@ -270,7 +295,7 @@ def _site_id_from_url(url: str) -> str | None:
         "mercadolibre.com.mx": "MLM", "mercadolivre.com.br": "MLB",
         "mercadolibre.com.ar": "MLA", "mercadolibre.cl": "MLC",
         "mercadolibre.com.co": "MCO", "mercadolibre.com.pe": "MPE",
-        "mercadolibre.com.uy": "MLU",  # FIX: Código oficial de Uruguay es MLU, no MUy
+        "mercadolibre.com.uy": "MLU",  # FIX: Código oficial de Uruguay es MLU
         "mercadolibre.com.ec": "MEC",
         "mercadolibre.com.ve": "MLV",
     }
@@ -454,85 +479,85 @@ async def fetch_pdp(url: str) -> dict:
     decimals = "00"
     seller = "Mercado Livre / Vendedor Oficial" if "mercadolivre.com.br" in clean_url else "Mercado Libre / Vendedor Oficial"
 
-    # --- MÉTODO 1: Extracción vía JSON-LD ---
+    # --- MÉTODO 1: Extracción vía JSON-LD (Schema.org) ---
     try:
         json_ld_matches = re.findall(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', html, re.DOTALL)
         for json_str in json_ld_matches:
-            data = json.loads(json_str.strip())
-            if isinstance(data, list):
-                data = data[0] if len(data) > 0 else {}
+            json_str = json_str.strip().replace('\n', '').replace('\r', '')
+            try:
+                data = json.loads(json_str)
+                if isinstance(data, list):
+                    data = data[0] if len(data) > 0 else {}
 
-            # FIX: Se completó la condición incompleta de la línea 496
-            if data.get("@type") == "Product" or "offers" in data:
-                if "name" in data and data["name"]:
-                    title = data["name"]
+                # FIX: Condición completada correctamente
+                if data.get("@type") == "Product" or "offers" in data:
+                    if "name" in data and data["name"]:
+                        title = data["name"]
 
-                offers = data.get("offers", {})
-                if isinstance(offers, list) and len(offers) > 0:
-                    offers = offers[0]
+                    offers = data.get("offers", {})
+                    if isinstance(offers, list) and len(offers) > 0:
+                        offers = offers[0]
 
-                price_val = offers.get("price") or offers.get("lowPrice") or offers.get("highPrice")
-                if price_val is not None and str(price_val) not in ("0", ""):
-                    integer, decimals = parse_localized_price(str(price_val), currency)[:2]
+                    price_val = offers.get("price") or offers.get("lowPrice") or offers.get("highPrice")
+                    if price_val is not None and str(price_val) not in ("0", ""):
+                        integer, decimals = parse_localized_price(str(price_val), currency)[:2]
 
-                if offers.get("priceCurrency"):
-                    currency = CURRENCY_SYMBOLS.get(offers["priceCurrency"], offers["priceCurrency"])
-                break
+                    if offers.get("priceCurrency"):
+                        currency = CURRENCY_SYMBOLS.get(offers["priceCurrency"], offers["priceCurrency"])
+                    break
+            except json.JSONDecodeError:
+                continue # Ignorar bloques JSON mal formados y seguir con el siguiente
     except Exception as e:
         logger.warning(f"Error parseando JSON-LD: {e}")
 
     # --- MÉTODO 2: Parsing de HTML mediante Selectores CSS ---
-    if integer == "0" or not title or "Por segurança" in str(title):
+    if integer == "0" or not title or "seguridad" in str(title).lower() or "segurança" in str(title).lower():
         if USE_SELECTOLAX:
             tree = HTMLParser(html)
-            if not title or "Por segurança" in str(title):
+            if not title or "seguridad" in str(title).lower():
                 t_node = tree.css_first("h1.ui-pdp-title") or tree.css_first("h1.poly-component__title") or tree.css_first("h1")
-                if t_node and t_node.text(strip=True) and "Por segurança" not in t_node.text(strip=True):
+                if t_node and t_node.text(strip=True) and "seguridad" not in t_node.text(strip=True).lower():
                     title = t_node.text(strip=True)
 
             if integer == "0":
                 i_node = (
-                    tree.css_first(".ui-pdp-price__second-line span.andes-money-amount__fraction") or
-                    tree.css_first("span.andes-money-amount__fraction") or
-                    tree.css_first(".andes-money-amount__fraction")
+                    tree.css_first(".ui-pdp-price__second-line .andes-money-amount__fraction") or
+                    tree.css_first(".andes-money-amount__fraction") or
+                    tree.css_first("span.andes-money-amount__fraction")
                 )
                 if i_node:
                     integer = i_node.text(strip=True)
 
                 d_node = (
-                    tree.css_first(".ui-pdp-price__second-line span.andes-money-amount__cents") or
-                    tree.css_first("span.andes-money-amount__cents") or
-                    tree.css_first(".andes-money-amount__cents")
+                    tree.css_first(".ui-pdp-price__second-line .andes-money-amount__cents") or
+                    tree.css_first(".andes-money-amount__cents") or
+                    tree.css_first("span.andes-money-amount__cents")
                 )
                 if d_node:
-                    decimals = d_node.text(strip=True)
-
-            s_node = tree.css_first(".ui-pdp-seller__link-trigger") or tree.css_first(".ui-seller-info__title")
-            if s_node and s_node.text(strip=True):
-                seller = s_node.text(strip=True)
+                    decimals = d_node.text(strip=True).replace(",", "").replace(".", "")
         else:
             soup = BeautifulSoup(html, "html.parser")
-            if not title or "Por segurança" in str(title):
+            if not title or "seguridad" in str(title).lower():
                 t_node = soup.select_one("h1.ui-pdp-title") or soup.select_one("h1.poly-component__title") or soup.select_one("h1")
-                if t_node and t_node.get_text(strip=True) and "Por segurança" not in t_node.get_text(strip=True):
+                if t_node and t_node.get_text(strip=True) and "seguridad" not in t_node.get_text(strip=True).lower():
                     title = t_node.get_text(strip=True)
 
             if integer == "0":
-                i_node = soup.select_one("span.andes-money-amount__fraction") or soup.select_one(".andes-money-amount__fraction")
+                i_node = soup.select_one(".andes-money-amount__fraction") or soup.select_one("span.andes-money-amount__fraction")
                 if i_node:
                     integer = i_node.get_text(strip=True)
 
-                d_node = soup.select_one("span.andes-money-amount__cents") or soup.select_one(".andes-money-amount__cents")
+                d_node = soup.select_one(".andes-money-amount__cents") or soup.select_one("span.andes-money-amount__cents")
                 if d_node:
-                    decimals = d_node.get_text(strip=True)
+                    decimals = d_node.get_text(strip=True).replace(",", "").replace(".", "")
 
-            s_node = soup.select_one(".ui-pdp-seller__link-trigger") or soup.select_one(".ui-seller-info__title")
-            if s_node and s_node.get_text(strip=True):
-                seller = s_node.get_text(strip=True)
-
-    # --- MÉTODO 2.5: Estado embebido de la PDP ---
+    # --- MÉTODO 2.5: Estado embebido de la PDP (scripts React/Redux) ---
     if integer == "0":
         state_price = extract_price_from_state_scripts(html)
+        if not state_price:
+            # Intentar con la nueva búsqueda profunda
+            state_price = extract_price_from_deep_scripts(html)
+            
         if state_price:
             if "amount" in state_price:
                 integer, decimals, sym = set_price_from_number(state_price["amount"], None)
@@ -541,12 +566,15 @@ async def fetch_pdp(url: str) -> dict:
             elif "localized" in state_price:
                 integer, decimals, currency = parse_localized_price(state_price["localized"], currency)
 
+    # Fallback si el título vino vacío o con mensaje de bloqueo
     if not title or "seguridad" in str(title).lower() or "segurança" in str(title).lower():
         title = clean_title_from_url(clean_url)
 
-    # --- MÉTODO 3: Fallback con la API Oficial ---
-    if integer in ("0", ""):
-        fb = await fetch_from_official_api(url)
+    # --- MÉTODO 3: Fallback AGRESIVO con la API Oficial ---
+    # Si el precio sigue siendo 0, o si el HTML contiene "Ver precio", 
+    # la API oficial es la ÚNICA forma confiable de obtenerlo sin un navegador real.
+    if integer in ("0", "") or (title and "ver precio" in str(title).lower()):
+        fb = await fetch_from_official_api(url) # Pasa la URL original para capturar el 'wid' si existe
         if fb:
             cache_set(clean_url, fb)
             return fb
